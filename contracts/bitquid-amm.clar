@@ -1,5 +1,18 @@
 ;; Bitcoin AMM Protocol
 ;; Implements automated liquidity pools with dynamic pricing, governance, and yield farming
+
+;; Define the fungible token trait
+(define-trait ft-trait
+    (
+        ;; Transfer from the caller to a new principal
+        (transfer (uint principal principal (optional (buff 34))) (response bool uint))
+        ;; Get the token balance of owner
+        (get-balance (principal) (response uint uint))
+        ;; Get the total supply of tokens
+        (get-total-supply () (response uint uint))
+    )
+)
+
 ;; Error codes
 (define-constant ERR-NOT-AUTHORIZED (err u1000))
 (define-constant ERR-INSUFFICIENT-BALANCE (err u1001))
@@ -15,13 +28,7 @@
 (define-constant ERR-SLIPPAGE-TOO-HIGH (err u1011))
 (define-constant ERR-INSUFFICIENT-COLLATERAL (err u1012))
 (define-constant ERR-INVALID-REWARD-CLAIM (err u1013))
-
-
-;; traits
-;;
-
-;; token definitions
-;;
+(define-constant ERR-GOVERNANCE-TOKEN-NOT-SET (err u1014))
 
 ;; Constants for protocol parameters
 (define-constant CONTRACT-OWNER tx-sender)
@@ -32,18 +39,16 @@
 (define-constant FLASH-LOAN-FEE u10) ;; 0.1% flash loan fee
 (define-constant ORACLE-VALIDITY-PERIOD u150) ;; ~25 minutes in blocks
 (define-constant REWARD-MULTIPLIER u100)
-(define-constant GOVERNANCE-TOKEN 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.governance-token)
-
-
 
 ;; Data variables
 (define-data-var next-pool-id uint u0)
 (define-data-var next-loan-id uint u0)
 (define-data-var total-fees-collected uint u0)
 (define-data-var protocol-fee-rate uint u50) ;; 0.5% protocol fee
-(define-data-var emergency-shutdown boolean false)
+(define-data-var emergency-shutdown bool false)
 (define-data-var price-oracle-last-update uint u0)
 (define-data-var governance-threshold uint u1000000)
+(define-data-var governance-token (optional principal) none)
 
 
 ;; Data maps for storing pool information
@@ -112,29 +117,38 @@
 
 ;; Public functions
 
-(define-public (create-pool (token-x principal) (token-y principal) (initial-x uint) (initial-y uint))
+;; Updated public functions with proper trait handling
+
+(define-public (create-pool (token-x <ft-trait>) (token-y <ft-trait>) (initial-x uint) (initial-y uint))
     (let (
         (pool-id (var-get next-pool-id))
+        (token-x-principal (contract-of token-x))
+        (token-y-principal (contract-of token-y))
     )
-    (asserts! (not (is-eq token-x token-y)) ERR-INVALID-PAIR)
+    (asserts! (not (is-eq token-x-principal token-y-principal)) ERR-INVALID-PAIR)
     (asserts! (> initial-x u0) ERR-ZERO-LIQUIDITY)
     (asserts! (> initial-y u0) ERR-ZERO-LIQUIDITY)
     
     ;; Transfer initial liquidity
-    (try! (contract-call? token-x transfer initial-x tx-sender (as-contract tx-sender)))
-    (try! (contract-call? token-y transfer initial-y tx-sender (as-contract tx-sender)))
+    (try! (contract-call? token-x transfer initial-x tx-sender (as-contract tx-sender) none))
+    (try! (contract-call? token-y transfer initial-y tx-sender (as-contract tx-sender) none))
     
     ;; Create pool
     (map-set pools 
         { pool-id: pool-id }
         {
-            token-x: token-x,
-            token-y: token-y,
+            token-x: token-x-principal,
+            token-y: token-y-principal,
             reserve-x: initial-x,
             reserve-y: initial-y,
             total-supply: INITIAL-LIQUIDITY-TOKENS,
             fee-rate: u30, ;; 0.3% default fee
-            last-block: block-height
+            last-block: block-height,
+            cumulative-fee-x: u0,
+            cumulative-fee-y: u0,
+            price-cumulative-last: u0,
+            price-timestamp: block-height,
+            twap: u0
         }
     )
     
@@ -145,7 +159,11 @@
             shares: INITIAL-LIQUIDITY-TOKENS,
             rewards-claimed: u0,
             staked-amount: u0,
-            last-stake-block: block-height
+            last-stake-block: block-height,
+            fee-growth-checkpoint-x: u0,
+            fee-growth-checkpoint-y: u0,
+            unclaimed-fees-x: u0,
+            unclaimed-fees-y: u0
         }
     )
     
@@ -153,18 +171,19 @@
     (var-set next-pool-id (+ pool-id u1))
     (ok pool-id)))
 
-(define-public (add-liquidity (pool-id uint) (amount-x uint) (amount-y uint) (min-shares uint))
+(define-public (add-liquidity (pool-id uint) (token-x <ft-trait>) (token-y <ft-trait>) (amount-x uint) (amount-y uint) (min-shares uint))
     (let (
         (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
         (shares-to-mint (calculate-liquidity-shares amount-x amount-y (get reserve-x pool) (get reserve-y pool) (get total-supply pool)))
     )
-    
-    ;; Validation
+    ;; Validate token addresses match pool
+    (asserts! (is-eq (contract-of token-x) (get token-x pool)) ERR-INVALID-PAIR)
+    (asserts! (is-eq (contract-of token-y) (get token-y pool)) ERR-INVALID-PAIR)
     (asserts! (>= shares-to-mint min-shares) ERR-MIN-TOKENS)
     
     ;; Transfer tokens
-    (try! (contract-call? (get token-x pool) transfer amount-x tx-sender (as-contract tx-sender)))
-    (try! (contract-call? (get token-y pool) transfer amount-y tx-sender (as-contract tx-sender)))
+    (try! (contract-call? token-x transfer amount-x tx-sender (as-contract tx-sender) none))
+    (try! (contract-call? token-y transfer amount-y tx-sender (as-contract tx-sender) none))
     
     ;; Update pool
     (map-set pools
@@ -191,54 +210,67 @@
                 shares: shares-to-mint,
                 rewards-claimed: u0,
                 staked-amount: u0,
-                last-stake-block: block-height
+                last-stake-block: block-height,
+                fee-growth-checkpoint-x: u0,
+                fee-growth-checkpoint-y: u0,
+                unclaimed-fees-x: u0,
+                unclaimed-fees-y: u0
             }
         )
     )
     
-    (ok shares-to-mint))
-)
+    (ok shares-to-mint)))
 
-(define-public (swap-exact-x-for-y (pool-id uint) (amount-x uint) (min-y uint))
+(define-public (swap-exact-x-for-y (pool-id uint) (token-x <ft-trait>) (token-y <ft-trait>) (amount-x uint) (min-y uint))
     (let (
         (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
-        (output (unwrap! (calculate-swap-output pool-id amount-x true) ERR-POOL-NOT-FOUND))
+        (swap-output (unwrap! (calculate-swap-output pool-id amount-x true) ERR-POOL-NOT-FOUND))
+        (output-amount (get output swap-output))
+        (fee-amount (get fee swap-output))
     )
     
     ;; Validations
-    (asserts! (>= (get output output) min-y) ERR-MIN-TOKENS)
+    (asserts! (is-eq (contract-of token-x) (get token-x pool)) ERR-INVALID-PAIR)
+    (asserts! (is-eq (contract-of token-y) (get token-y pool)) ERR-INVALID-PAIR)
+    (asserts! (>= output-amount min-y) ERR-MIN-TOKENS)
     (asserts! (check-price-impact amount-x (get reserve-x pool)) ERR-PRICE-IMPACT-HIGH)
     
     ;; Transfer tokens
-    (try! (contract-call? (get token-x pool) transfer amount-x tx-sender (as-contract tx-sender)))
-    (try! (as-contract (contract-call? (get token-y pool) transfer (get output output) (as-contract tx-sender) tx-sender)))
+    (try! (contract-call? token-x transfer amount-x tx-sender (as-contract tx-sender) none))
+    (try! (as-contract (contract-call? token-y transfer output-amount (as-contract tx-sender) tx-sender none)))
     
     ;; Update pool
     (map-set pools
         { pool-id: pool-id }
         (merge pool {
             reserve-x: (+ (get reserve-x pool) amount-x),
-            reserve-y: (- (get reserve-y pool) (get output output)),
+            reserve-y: (- (get reserve-y pool) output-amount),
             last-block: block-height
         })
     )
     
     ;; Update protocol fees
-    (var-set total-fees-collected (+ (var-get total-fees-collected) (get fee output)))
+    (var-set total-fees-collected (+ (var-get total-fees-collected) fee-amount))
     
-    (ok (get output output)))
+    (ok output-amount))
 )
+
 
 ;; Governance functions
 
-(define-public (stake-governance (amount uint) (lock-blocks uint))
+;; Update stake-governance to use the variable governance token
+(define-public (stake-governance (token <ft-trait>) (amount uint) (lock-blocks uint))
     (let (
-        (current-stake (default-to { amount: u0, power: u0, lock-until: u0 } 
+        (current-stake (default-to { amount: u0, power: u0, lock-until: u0, delegation: none } 
             (map-get? governance-stakes { staker: tx-sender })))
+        (gov-token (unwrap! (var-get governance-token) ERR-GOVERNANCE-TOKEN-NOT-SET))
     )
     
+    ;; Verify correct token
+    (asserts! (is-eq (contract-of token) gov-token) ERR-NOT-AUTHORIZED)
+    
     ;; Transfer governance tokens
-    (try! (contract-call? GOVERNANCE-TOKEN transfer amount tx-sender (as-contract tx-sender)))
+    (try! (contract-call? token transfer amount tx-sender (as-contract tx-sender) none))
     
     ;; Calculate voting power (more power for longer locks)
     (let (
@@ -251,11 +283,23 @@
         {
             amount: (+ (get amount current-stake) amount),
             power: (+ (get power current-stake) power),
-            lock-until: (+ block-height lock-blocks)
+            lock-until: (+ block-height lock-blocks),
+            delegation: (get delegation current-stake)
         }
     )
     
     (ok power)))
+
+;; Add governance token management functions
+(define-public (set-governance-token (token principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (ok (var-set governance-token (some token)))
+    )
+)
+
+(define-public (get-governance-token)
+    (ok (var-get governance-token))
 )
 
 ;; Emergency functions
@@ -269,12 +313,15 @@
 
 ;; Enhanced swap functions with flash loan support
 
-(define-public (flash-swap (pool-id uint) (amount-x uint) (callback-contract principal))
+(define-public (flash-swap (pool-id uint) (token-x <ft-trait>) (token-y <ft-trait>) (amount-x uint) (callback-contract principal))
     (let (
         (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
         (loan-id (var-get next-loan-id))
         (fee (* amount-x FLASH-LOAN-FEE))
     )
+    ;; Validate token matches pool
+    (asserts! (is-eq (contract-of token-x) (get token-x pool)) ERR-INVALID-PAIR)
+    (asserts! (is-eq (contract-of token-y) (get token-y pool)) ERR-INVALID-PAIR)
     
     ;; Create flash loan record
     (map-set flash-loans
@@ -282,25 +329,47 @@
         {
             borrower: tx-sender,
             amount: amount-x,
-            token: (get token-x pool),
+            token: (contract-of token-x),
             due-block: (+ block-height u1)
         }
     )
     
     ;; Transfer tokens to borrower
-    (try! (as-contract (contract-call? (get token-x pool) transfer amount-x (as-contract tx-sender) tx-sender)))
+    (try! (as-contract (contract-call? token-x transfer 
+        amount-x 
+        (as-contract tx-sender) 
+        tx-sender 
+        none)))
     
     ;; Execute callback
-    (try! (contract-call? callback-contract execute-flash-swap loan-id))
+    (try! (contract-call? callback-contract execute-flash-swap loan-id pool-id))
     
     ;; Verify repayment
-    (asserts! (>= (get reserve-x pool) (+ amount-x fee)) ERR-FLASH-LOAN-FAILED)
-    
-    ;; Update state
-    (var-set next-loan-id (+ loan-id u1))
-    (var-set total-fees-collected (+ (var-get total-fees-collected) fee))
-    
-    (ok loan-id))
+    (let ((updated-pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND)))
+        (asserts! (>= (get reserve-x updated-pool) (+ amount-x fee)) ERR-FLASH-LOAN-FAILED)
+        
+        ;; Update state
+        (var-set next-loan-id (+ loan-id u1))
+        (var-set total-fees-collected (+ (var-get total-fees-collected) fee))
+        
+        (ok loan-id)))
+)
+
+;; Add a trait definition for the flash loan callback
+(define-trait flash-loan-callback-trait
+    ((execute-flash-swap (uint uint) (response bool uint)))
+)
+
+;; Update the flash loan callbacks
+(define-public (execute-flash-swap (loan-id uint) (pool-id uint))
+    (let ((loan (unwrap! (map-get? flash-loans { loan-id: loan-id }) ERR-POOL-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (get borrower loan)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= block-height (get due-block loan)) ERR-EXPIRED)
+        
+        ;; Implementation specific to the callback
+        ;; This should be implemented by the contract calling flash-swap
+        
+        (ok true))
 )
 
 ;; Multi-hop swap functionality
@@ -482,6 +551,7 @@
 
 ;; Internal functions
 
+;; Update the calculate-liquidity-shares function to use our min implementation
 (define-private (calculate-liquidity-shares (amount-x uint) (amount-y uint) (reserve-x uint) (reserve-y uint) (total-supply uint))
     (if (is-eq total-supply u0)
         INITIAL-LIQUIDITY-TOKENS
@@ -489,8 +559,13 @@
             (/ (* amount-x total-supply) reserve-x)
             (/ (* amount-y total-supply) reserve-y)
         )
-    )
-)
+    ))
+
+;; Add the min function implementation
+(define-private (min (a uint) (b uint))
+    (if (<= a b)
+        a
+        b))
 
 (define-private (check-price-impact (amount uint) (reserve uint))
     (let (
@@ -550,4 +625,5 @@
     )
     
     (ok true))
+)
 )
