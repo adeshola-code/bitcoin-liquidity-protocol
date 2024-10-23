@@ -10,6 +10,11 @@
 (define-constant ERR-PRICE-IMPACT-HIGH (err u1006))
 (define-constant ERR-EXPIRED (err u1007))
 (define-constant ERR-MIN-TOKENS (err u1008))
+(define-constant ERR-FLASH-LOAN-FAILED (err u1009))
+(define-constant ERR-ORACLE-STALE (err u1010))
+(define-constant ERR-SLIPPAGE-TOO-HIGH (err u1011))
+(define-constant ERR-INSUFFICIENT-COLLATERAL (err u1012))
+(define-constant ERR-INVALID-REWARD-CLAIM (err u1013))
 
 
 ;; traits
