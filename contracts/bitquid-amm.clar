@@ -30,8 +30,38 @@
 ;; data vars
 ;;
 
-;; data maps
-;;
+;; Data maps for storing pool information
+(define-map pools 
+    { pool-id: uint }
+    {
+        token-x: principal,
+        token-y: principal,
+        reserve-x: uint,
+        reserve-y: uint,
+        total-supply: uint,
+        fee-rate: uint,
+        last-block: uint
+    }
+)
+
+(define-map liquidity-providers
+    { pool-id: uint, provider: principal }
+    {
+        shares: uint,
+        rewards-claimed: uint,
+        staked-amount: uint,
+        last-stake-block: uint
+    }
+)
+
+(define-map governance-stakes
+    { staker: principal }
+    {
+        amount: uint,
+        power: uint,
+        lock-until: uint
+    }
+)
 
 ;; public functions
 ;;
