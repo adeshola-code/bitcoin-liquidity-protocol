@@ -267,6 +267,160 @@
     )
 )
 
+;; Enhanced swap functions with flash loan support
+
+(define-public (flash-swap (pool-id uint) (amount-x uint) (callback-contract principal))
+    (let (
+        (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
+        (loan-id (var-get next-loan-id))
+        (fee (* amount-x FLASH-LOAN-FEE))
+    )
+    
+    ;; Create flash loan record
+    (map-set flash-loans
+        { loan-id: loan-id }
+        {
+            borrower: tx-sender,
+            amount: amount-x,
+            token: (get token-x pool),
+            due-block: (+ block-height u1)
+        }
+    )
+    
+    ;; Transfer tokens to borrower
+    (try! (as-contract (contract-call? (get token-x pool) transfer amount-x (as-contract tx-sender) tx-sender)))
+    
+    ;; Execute callback
+    (try! (contract-call? callback-contract execute-flash-swap loan-id))
+    
+    ;; Verify repayment
+    (asserts! (>= (get reserve-x pool) (+ amount-x fee)) ERR-FLASH-LOAN-FAILED)
+    
+    ;; Update state
+    (var-set next-loan-id (+ loan-id u1))
+    (var-set total-fees-collected (+ (var-get total-fees-collected) fee))
+    
+    (ok loan-id))
+)
+
+;; Multi-hop swap functionality
+
+(define-public (multi-hop-swap (path (list 10 uint)) (amount-in uint) (min-amount-out uint))
+    (let (
+        (first-pool (unwrap! (map-get? pools { pool-id: (unwrap! (element-at path u0) ERR-INVALID-PAIR) }) ERR-POOL-NOT-FOUND))
+        (current-amount amount-in)
+    )
+    
+    ;; Execute swaps through path
+    (fold check-and-execute-swap path current-amount)
+    
+    ;; Verify final amount meets minimum
+    (asserts! (>= current-amount min-amount-out) ERR-SLIPPAGE-TOO-HIGH)
+    
+    (ok current-amount))
+)
+
+;; Yield farming functions
+
+(define-public (create-farm (pool-id uint) (reward-token principal) (reward-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        
+        (map-set yield-farms
+            { pool-id: pool-id }
+            {
+                reward-token: reward-token,
+                reward-per-block: reward-rate,
+                total-staked: u0,
+                last-reward-block: block-height,
+                accumulated-reward-per-share: u0
+            }
+        )
+        
+        (ok true))
+)
+
+(define-public (stake-in-farm (pool-id uint) (amount uint))
+    (let (
+        (provider-info (unwrap! (map-get? liquidity-providers { pool-id: pool-id, provider: tx-sender }) ERR-NOT-AUTHORIZED))
+        (farm (unwrap! (map-get? yield-farms { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
+    )
+    
+    ;; Update rewards before changing stakes
+    (try! (update-farm-rewards pool-id))
+    
+    ;; Update provider stake
+    (map-set liquidity-providers
+        { pool-id: pool-id, provider: tx-sender }
+        (merge provider-info {
+            staked-amount: (+ (get staked-amount provider-info) amount),
+            last-stake-block: block-height
+        })
+    )
+    
+    ;; Update farm total stake
+    (map-set yield-farms
+        { pool-id: pool-id }
+        (merge farm {
+            total-staked: (+ (get total-staked farm) amount)
+        })
+    )
+    
+    (ok true))
+)
+
+;; Price oracle functions
+
+(define-public (update-price-oracle (pool-id uint))
+    (let (
+        (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
+        (time-elapsed (- block-height (get price-timestamp pool)))
+        (price-cumulative (* (/ (get reserve-y pool) (get reserve-x pool)) time-elapsed))
+    )
+    
+    (map-set pools
+        { pool-id: pool-id }
+        (merge pool {
+            price-cumulative-last: (+ (get price-cumulative-last pool) price-cumulative),
+            price-timestamp: block-height,
+            twap: (/ price-cumulative time-elapsed)
+        })
+    )
+    
+    (var-set price-oracle-last-update block-height)
+    (ok true))
+)
+
+;; Enhanced governance functions
+
+(define-public (delegate-votes (delegate-to principal))
+    (let (
+        (current-stake (unwrap! (map-get? governance-stakes { staker: tx-sender }) ERR-NOT-AUTHORIZED))
+    )
+    
+    (map-set governance-stakes
+        { staker: tx-sender }
+        (merge current-stake {
+            delegation: (some delegate-to)
+        })
+    )
+    
+    (ok true))
+)
+
+(define-public (propose-parameter-change (parameter-name (string-ascii 64)) (new-value uint))
+    (let (
+        (proposer-stake (unwrap! (map-get? governance-stakes { staker: tx-sender }) ERR-NOT-AUTHORIZED))
+    )
+    
+    ;; Check if proposer has enough stake
+    (asserts! (>= (get power proposer-stake) (var-get governance-threshold)) ERR-NOT-AUTHORIZED)
+    
+    ;; Implement proposal logic here
+    
+    (ok true))
+)
+
 ;; Read-only functions
 
 (define-read-only (get-pool-details (pool-id uint))
