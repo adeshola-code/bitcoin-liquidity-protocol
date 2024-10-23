@@ -53,7 +53,12 @@
         reserve-y: uint,
         total-supply: uint,
         fee-rate: uint,
-        last-block: uint
+        last-block: uint,
+        cumulative-fee-x: uint,
+        cumulative-fee-y: uint,
+        price-cumulative-last: uint,
+        price-timestamp: uint,
+        twap: uint
     }
 )
 
