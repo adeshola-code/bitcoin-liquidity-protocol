@@ -67,8 +67,124 @@
     }
 )
 
-;; public functions
-;;
+;; Public functions
+
+(define-public (create-pool (token-x principal) (token-y principal) (initial-x uint) (initial-y uint))
+    (let (
+        (pool-id (var-get next-pool-id))
+    )
+    (asserts! (not (is-eq token-x token-y)) ERR-INVALID-PAIR)
+    (asserts! (> initial-x u0) ERR-ZERO-LIQUIDITY)
+    (asserts! (> initial-y u0) ERR-ZERO-LIQUIDITY)
+    
+    ;; Transfer initial liquidity
+    (try! (contract-call? token-x transfer initial-x tx-sender (as-contract tx-sender)))
+    (try! (contract-call? token-y transfer initial-y tx-sender (as-contract tx-sender)))
+    
+    ;; Create pool
+    (map-set pools 
+        { pool-id: pool-id }
+        {
+            token-x: token-x,
+            token-y: token-y,
+            reserve-x: initial-x,
+            reserve-y: initial-y,
+            total-supply: INITIAL-LIQUIDITY-TOKENS,
+            fee-rate: u30, ;; 0.3% default fee
+            last-block: block-height
+        }
+    )
+    
+    ;; Set initial liquidity provider
+    (map-set liquidity-providers
+        { pool-id: pool-id, provider: tx-sender }
+        {
+            shares: INITIAL-LIQUIDITY-TOKENS,
+            rewards-claimed: u0,
+            staked-amount: u0,
+            last-stake-block: block-height
+        }
+    )
+    
+    ;; Increment pool ID
+    (var-set next-pool-id (+ pool-id u1))
+    (ok pool-id)))
+
+(define-public (add-liquidity (pool-id uint) (amount-x uint) (amount-y uint) (min-shares uint))
+    (let (
+        (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
+        (shares-to-mint (calculate-liquidity-shares amount-x amount-y (get reserve-x pool) (get reserve-y pool) (get total-supply pool)))
+    )
+    
+    ;; Validation
+    (asserts! (>= shares-to-mint min-shares) ERR-MIN-TOKENS)
+    
+    ;; Transfer tokens
+    (try! (contract-call? (get token-x pool) transfer amount-x tx-sender (as-contract tx-sender)))
+    (try! (contract-call? (get token-y pool) transfer amount-y tx-sender (as-contract tx-sender)))
+    
+    ;; Update pool
+    (map-set pools
+        { pool-id: pool-id }
+        (merge pool {
+            reserve-x: (+ (get reserve-x pool) amount-x),
+            reserve-y: (+ (get reserve-y pool) amount-y),
+            total-supply: (+ (get total-supply pool) shares-to-mint)
+        })
+    )
+    
+    ;; Update provider
+    (match (map-get? liquidity-providers { pool-id: pool-id, provider: tx-sender })
+        prev-balance
+        (map-set liquidity-providers
+            { pool-id: pool-id, provider: tx-sender }
+            (merge prev-balance {
+                shares: (+ (get shares prev-balance) shares-to-mint)
+            })
+        )
+        (map-set liquidity-providers
+            { pool-id: pool-id, provider: tx-sender }
+            {
+                shares: shares-to-mint,
+                rewards-claimed: u0,
+                staked-amount: u0,
+                last-stake-block: block-height
+            }
+        )
+    )
+    
+    (ok shares-to-mint))
+)
+
+(define-public (swap-exact-x-for-y (pool-id uint) (amount-x uint) (min-y uint))
+    (let (
+        (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
+        (output (unwrap! (calculate-swap-output pool-id amount-x true) ERR-POOL-NOT-FOUND))
+    )
+    
+    ;; Validations
+    (asserts! (>= (get output output) min-y) ERR-MIN-TOKENS)
+    (asserts! (check-price-impact amount-x (get reserve-x pool)) ERR-PRICE-IMPACT-HIGH)
+    
+    ;; Transfer tokens
+    (try! (contract-call? (get token-x pool) transfer amount-x tx-sender (as-contract tx-sender)))
+    (try! (as-contract (contract-call? (get token-y pool) transfer (get output output) (as-contract tx-sender) tx-sender)))
+    
+    ;; Update pool
+    (map-set pools
+        { pool-id: pool-id }
+        (merge pool {
+            reserve-x: (+ (get reserve-x pool) amount-x),
+            reserve-y: (- (get reserve-y pool) (get output output)),
+            last-block: block-height
+        })
+    )
+    
+    ;; Update protocol fees
+    (var-set total-fees-collected (+ (var-get total-fees-collected) (get fee output)))
+    
+    (ok (get output output)))
+)
 
 ;; Read-only functions
 (define-read-only (get-pool-details (pool-id uint))
