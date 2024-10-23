@@ -499,3 +499,55 @@
     (<= impact MAX-PRICE-IMPACT))
 )
 
+;; Internal helper functions
+
+(define-private (update-farm-rewards (pool-id uint))
+    (let (
+        (farm (unwrap! (map-get? yield-farms { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
+        (blocks-elapsed (- block-height (get last-reward-block farm)))
+        (rewards-to-distribute (* blocks-elapsed (get reward-per-block farm)))
+    )
+    
+    (if (and (> blocks-elapsed u0) (> (get total-staked farm) u0))
+        (map-set yield-farms
+            { pool-id: pool-id }
+            (merge farm {
+                accumulated-reward-per-share: (+ (get accumulated-reward-per-share farm)
+                    (/ (* rewards-to-distribute REWARD-MULTIPLIER) (get total-staked farm))),
+                last-reward-block: block-height
+            })
+        )
+        true)
+    
+    (ok true))
+)
+
+(define-private (check-and-execute-swap (pool-id uint) (amount-in uint))
+    (let (
+        (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
+        (output (unwrap! (calculate-swap-output pool-id amount-in true) ERR-POOL-NOT-FOUND))
+    )
+    
+    ;; Execute swap
+    (try! (execute-single-swap pool-id amount-in (get output output)))
+    
+    (ok (get output output)))
+)
+
+(define-private (execute-single-swap (pool-id uint) (amount-in uint) (amount-out uint))
+    (let (
+        (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
+    )
+    
+    ;; Update reserves
+    (map-set pools
+        { pool-id: pool-id }
+        (merge pool {
+            reserve-x: (+ (get reserve-x pool) amount-in),
+            reserve-y: (- (get reserve-y pool) amount-out),
+            last-block: block-height
+        })
+    )
+    
+    (ok true))
+)
