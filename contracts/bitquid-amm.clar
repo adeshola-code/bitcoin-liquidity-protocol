@@ -115,6 +115,145 @@
     }
 )
 
+;; Internal functions
+;; Update the calculate-liquidity-shares function to use our min implementation
+
+(define-private (min (a uint) (b uint))
+    (if (<= a b)
+        a
+        b))
+
+(define-private (calculate-liquidity-shares (amount-x uint) (amount-y uint) (reserve-x uint) (reserve-y uint) (total-supply uint))
+    (if (is-eq total-supply u0)
+        INITIAL-LIQUIDITY-TOKENS
+        (min
+            (/ (* amount-x total-supply) reserve-x)
+            (/ (* amount-y total-supply) reserve-y)
+        )
+    ))
+
+(define-private (check-price-impact (amount uint) (reserve uint))
+    (let (
+        (impact (/ (* amount u10000) reserve))
+    )
+    (<= impact MAX-PRICE-IMPACT))
+)
+
+(define-private (update-farm-rewards (pool-id uint))
+    (let (
+        (farm (unwrap! (map-get? yield-farms { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
+        (blocks-elapsed (- block-height (get last-reward-block farm)))
+        (rewards-to-distribute (* blocks-elapsed (get reward-per-block farm)))
+    )
+    
+    (if (and (> blocks-elapsed u0) (> (get total-staked farm) u0))
+        (map-set yield-farms
+            { pool-id: pool-id }
+            (merge farm {
+                accumulated-reward-per-share: (+ (get accumulated-reward-per-share farm)
+                    (/ (* rewards-to-distribute REWARD-MULTIPLIER) (get total-staked farm))),
+                last-reward-block: block-height
+            })
+        )
+        true)
+    
+    (ok true))
+)
+
+(define-private (execute-single-swap (pool-id uint) (amount-in uint) (amount-out uint))
+    (let (
+        (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
+    )
+    
+    ;; Update reserves
+    (map-set pools
+        { pool-id: pool-id }
+        (merge pool {
+            reserve-x: (+ (get reserve-x pool) amount-in),
+            reserve-y: (- (get reserve-y pool) amount-out),
+            last-block: block-height
+        })
+    )
+    
+    (ok true))
+)
+
+(define-private (check-and-execute-swap (pool-id uint) (amount-in uint))
+    (let (
+        (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
+        (output (unwrap! (calculate-swap-output pool-id amount-in true) ERR-POOL-NOT-FOUND))
+    )
+    
+    ;; Execute swap
+    (try! (execute-single-swap pool-id amount-in (get output output)))
+    
+    (ok (get output output)))
+)
+
+;; Read-only functions
+(define-read-only (get-pool-details (pool-id uint))
+    (match (map-get? pools { pool-id: pool-id })
+        pool-info (ok pool-info)
+        (err ERR-POOL-NOT-FOUND)
+    )
+)
+
+(define-read-only (get-twap-price (pool-id uint))
+    (match (map-get? pools { pool-id: pool-id })
+        pool-info 
+        (let (
+            (time-elapsed (- block-height (get price-timestamp pool-info)))
+        )
+        (if (>= time-elapsed ORACLE-VALIDITY-PERIOD)
+            (err ERR-ORACLE-STALE)
+            (ok (get twap pool-info))))
+        (err ERR-POOL-NOT-FOUND)
+    )
+)
+
+(define-read-only (calculate-swap-output (pool-id uint) (input-amount uint) (is-x-to-y bool))
+    (match (map-get? pools { pool-id: pool-id })
+        pool-info 
+        (let (
+            (reserve-in (if is-x-to-y (get reserve-x pool-info) (get reserve-y pool-info)))
+            (reserve-out (if is-x-to-y (get reserve-y pool-info) (get reserve-x pool-info)))
+            (fee-adjustment (- FEE-DENOMINATOR (get fee-rate pool-info)))
+        )
+        (ok {
+            output: (/ (* input-amount (* reserve-out fee-adjustment)) 
+                      (+ (* reserve-in FEE-DENOMINATOR) (* input-amount fee-adjustment))),
+            fee: (/ (* input-amount (get fee-rate pool-info)) FEE-DENOMINATOR)
+        }))
+        (err ERR-POOL-NOT-FOUND)
+    )
+)
+
+(define-read-only (calculate-rewards (pool-id uint) (staker principal))
+    (match (map-get? liquidity-providers { pool-id: pool-id, provider: staker })
+        provider-info
+        (match (map-get? yield-farms { pool-id: pool-id })
+            farm
+            (let (
+                (blocks-elapsed (- block-height (get last-stake-block provider-info)))
+                (reward-rate (get reward-per-block farm))
+                (stake-amount (get staked-amount provider-info))
+                (total-staked (get total-staked farm))
+            )
+            (ok (if (is-eq total-staked u0)
+                u0
+                (* (* blocks-elapsed reward-rate) (/ stake-amount total-staked)))))
+            (err ERR-POOL-NOT-FOUND))
+        (err ERR-NOT-AUTHORIZED)
+    )
+)
+
+(define-read-only (get-provider-info (pool-id uint) (provider principal))
+    (match (map-get? liquidity-providers { pool-id: pool-id, provider: provider })
+        provider-info (ok provider-info)
+        (err ERR-NOT-AUTHORIZED)
+    )
+)
+
 ;; Public functions
 
 ;; Updated public functions with proper trait handling
@@ -136,20 +275,20 @@
     ;; Create pool
     (map-set pools 
         { pool-id: pool-id }
-        {
-            token-x: token-x-principal,
-            token-y: token-y-principal,
-            reserve-x: initial-x,
-            reserve-y: initial-y,
-            total-supply: INITIAL-LIQUIDITY-TOKENS,
-            fee-rate: u30, ;; 0.3% default fee
-            last-block: block-height,
-            cumulative-fee-x: u0,
-            cumulative-fee-y: u0,
-            price-cumulative-last: u0,
-            price-timestamp: block-height,
-            twap: u0
-        }
+        (tuple
+            (token-x token-x-principal)
+            (token-y token-y-principal)
+            (reserve-x initial-x)
+            (reserve-y initial-y)
+            (total-supply INITIAL-LIQUIDITY-TOKENS)
+            (fee-rate u30) ;; 0.3% default fee
+            (last-block block-height)
+            (cumulative-fee-x u0)
+            (cumulative-fee-y u0)
+            (price-cumulative-last u0)
+            (price-timestamp block-height)
+            (twap u0)
+        )
     )
     
     ;; Set initial liquidity provider
@@ -259,36 +398,43 @@
 ;; Governance functions
 
 ;; Update stake-governance to use the variable governance token
+;; Governance functions
 (define-public (stake-governance (token <ft-trait>) (amount uint) (lock-blocks uint))
-    (let (
-        (current-stake (default-to { amount: u0, power: u0, lock-until: u0, delegation: none } 
-            (map-get? governance-stakes { staker: tx-sender })))
-        (gov-token (unwrap! (var-get governance-token) ERR-GOVERNANCE-TOKEN-NOT-SET))
+    (let 
+        (
+            (current-stake (default-to 
+                {
+                    amount: u0, 
+                    power: u0, 
+                    lock-until: u0, 
+                    delegation: none
+                } 
+                (map-get? governance-stakes { staker: tx-sender })
+            ))
+            (gov-token (unwrap! (var-get governance-token) ERR-GOVERNANCE-TOKEN-NOT-SET))
+            (power (* amount (+ u1 (/ lock-blocks u1000))))
+        )
+        
+        ;; Verify correct token
+        (asserts! (is-eq (contract-of token) gov-token) ERR-NOT-AUTHORIZED)
+        
+        ;; Transfer governance tokens
+        (try! (contract-call? token transfer amount tx-sender (as-contract tx-sender) none))
+        
+        ;; Update stake
+        (map-set governance-stakes
+            { staker: tx-sender }
+            {
+                amount: (+ (get amount current-stake) amount),
+                power: (+ (get power current-stake) power),
+                lock-until: (+ block-height lock-blocks),
+                delegation: (get delegation current-stake)
+            }
+        )
+        
+        (ok power)
     )
-    
-    ;; Verify correct token
-    (asserts! (is-eq (contract-of token) gov-token) ERR-NOT-AUTHORIZED)
-    
-    ;; Transfer governance tokens
-    (try! (contract-call? token transfer amount tx-sender (as-contract tx-sender) none))
-    
-    ;; Calculate voting power (more power for longer locks)
-    (let (
-        (power (* amount (+ u1 (/ lock-blocks u1000))))
-    )
-    
-    ;; Update stake
-    (map-set governance-stakes
-        { staker: tx-sender }
-        {
-            amount: (+ (get amount current-stake) amount),
-            power: (+ (get power current-stake) power),
-            lock-until: (+ block-height lock-blocks),
-            delegation: (get delegation current-stake)
-        }
-    )
-    
-    (ok power)))
+)
 
 ;; Add governance token management functions
 (define-public (set-governance-token (token principal))
@@ -353,11 +499,6 @@
         (var-set total-fees-collected (+ (var-get total-fees-collected) fee))
         
         (ok loan-id)))
-)
-
-;; Add a trait definition for the flash loan callback
-(define-trait flash-loan-callback-trait
-    ((execute-flash-swap (uint uint) (response bool uint)))
 )
 
 ;; Update the flash loan callbacks
@@ -490,140 +631,7 @@
     (ok true))
 )
 
-;; Read-only functions
-
-(define-read-only (get-pool-details (pool-id uint))
-    (match (map-get? pools { pool-id: pool-id })
-        pool-info (ok pool-info)
-        (err ERR-POOL-NOT-FOUND)
-    )
-)
-
-(define-read-only (get-twap-price (pool-id uint))
-    (match (map-get? pools { pool-id: pool-id })
-        pool-info 
-        (let (
-            (time-elapsed (- block-height (get price-timestamp pool-info)))
-        )
-        (asserts! (< time-elapsed ORACLE-VALIDITY-PERIOD) ERR-ORACLE-STALE)
-        (ok (get twap pool-info)))
-        (err ERR-POOL-NOT-FOUND)
-    )
-)
-
-(define-read-only (calculate-rewards (pool-id uint) (staker principal))
-    (match (map-get? liquidity-providers { pool-id: pool-id, provider: staker })
-        provider-info
-        (let (
-            (farm (unwrap! (map-get? yield-farms { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
-            (blocks-elapsed (- block-height (get last-stake-block provider-info)))
-            (reward-rate (get reward-per-block farm))
-            (stake-amount (get staked-amount provider-info))
-        )
-        (ok (* (* blocks-elapsed reward-rate) (/ stake-amount (get total-staked farm)))))
-        (err ERR-NOT-AUTHORIZED)
-    )
-)
-
-(define-read-only (get-provider-info (pool-id uint) (provider principal))
-    (match (map-get? liquidity-providers { pool-id: pool-id, provider: provider })
-        provider-info (ok provider-info)
-        (err ERR-NOT-AUTHORIZED)
-    )
-)
-
-(define-read-only (calculate-swap-output (pool-id uint) (input-amount uint) (is-x-to-y bool))
-    (match (map-get? pools { pool-id: pool-id })
-        pool-info 
-        (let (
-            (reserve-in (if is-x-to-y (get reserve-x pool-info) (get reserve-y pool-info)))
-            (reserve-out (if is-x-to-y (get reserve-y pool-info) (get reserve-x pool-info)))
-            (fee-adjustment (- FEE-DENOMINATOR (get fee-rate pool-info)))
-        )
-        (ok {
-            output: (/ (* input-amount (* reserve-out fee-adjustment)) 
-                      (+ (* reserve-in FEE-DENOMINATOR) (* input-amount fee-adjustment))),
-            fee: (/ (* input-amount (get fee-rate pool-info)) FEE-DENOMINATOR)
-        }))
-        (err ERR-POOL-NOT-FOUND)
-    )
-)
-
-;; Internal functions
-
-;; Update the calculate-liquidity-shares function to use our min implementation
-(define-private (calculate-liquidity-shares (amount-x uint) (amount-y uint) (reserve-x uint) (reserve-y uint) (total-supply uint))
-    (if (is-eq total-supply u0)
-        INITIAL-LIQUIDITY-TOKENS
-        (min
-            (/ (* amount-x total-supply) reserve-x)
-            (/ (* amount-y total-supply) reserve-y)
-        )
-    ))
-
-;; Add the min function implementation
-(define-private (min (a uint) (b uint))
-    (if (<= a b)
-        a
-        b))
-
-(define-private (check-price-impact (amount uint) (reserve uint))
-    (let (
-        (impact (/ (* amount u10000) reserve))
-    )
-    (<= impact MAX-PRICE-IMPACT))
-)
-
-;; Internal helper functions
-
-(define-private (update-farm-rewards (pool-id uint))
-    (let (
-        (farm (unwrap! (map-get? yield-farms { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
-        (blocks-elapsed (- block-height (get last-reward-block farm)))
-        (rewards-to-distribute (* blocks-elapsed (get reward-per-block farm)))
-    )
-    
-    (if (and (> blocks-elapsed u0) (> (get total-staked farm) u0))
-        (map-set yield-farms
-            { pool-id: pool-id }
-            (merge farm {
-                accumulated-reward-per-share: (+ (get accumulated-reward-per-share farm)
-                    (/ (* rewards-to-distribute REWARD-MULTIPLIER) (get total-staked farm))),
-                last-reward-block: block-height
-            })
-        )
-        true)
-    
-    (ok true))
-)
-
-(define-private (check-and-execute-swap (pool-id uint) (amount-in uint))
-    (let (
-        (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
-        (output (unwrap! (calculate-swap-output pool-id amount-in true) ERR-POOL-NOT-FOUND))
-    )
-    
-    ;; Execute swap
-    (try! (execute-single-swap pool-id amount-in (get output output)))
-    
-    (ok (get output output)))
-)
-
-(define-private (execute-single-swap (pool-id uint) (amount-in uint) (amount-out uint))
-    (let (
-        (pool (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
-    )
-    
-    ;; Update reserves
-    (map-set pools
-        { pool-id: pool-id }
-        (merge pool {
-            reserve-x: (+ (get reserve-x pool) amount-in),
-            reserve-y: (- (get reserve-y pool) amount-out),
-            last-block: block-height
-        })
-    )
-    
-    (ok true))
-)
+;; Add a trait definition for the flash loan callback
+(define-trait flash-loan-callback-trait
+    ((execute-flash-swap (uint uint) (response bool uint)))
 )
