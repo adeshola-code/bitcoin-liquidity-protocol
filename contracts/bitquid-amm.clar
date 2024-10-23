@@ -38,9 +38,12 @@
 
 ;; Data variables
 (define-data-var next-pool-id uint u0)
+(define-data-var next-loan-id uint u0)
 (define-data-var total-fees-collected uint u0)
 (define-data-var protocol-fee-rate uint u50) ;; 0.5% protocol fee
 (define-data-var emergency-shutdown boolean false)
+(define-data-var price-oracle-last-update uint u0)
+(define-data-var governance-threshold uint u1000000)
 
 
 ;; Data maps for storing pool information
@@ -68,7 +71,11 @@
         shares: uint,
         rewards-claimed: uint,
         staked-amount: uint,
-        last-stake-block: uint
+        last-stake-block: uint,
+        fee-growth-checkpoint-x: uint,
+        fee-growth-checkpoint-y: uint,
+        unclaimed-fees-x: uint,
+        unclaimed-fees-y: uint
     }
 )
 
@@ -77,7 +84,29 @@
     {
         amount: uint,
         power: uint,
-        lock-until: uint
+        lock-until: uint,
+        delegation: (optional principal)
+    }
+)
+
+(define-map flash-loans
+    { loan-id: uint }
+    {
+        borrower: principal,
+        amount: uint,
+        token: principal,
+        due-block: uint
+    }
+)
+
+(define-map yield-farms
+    { pool-id: uint }
+    {
+        reward-token: principal,
+        reward-per-block: uint,
+        total-staked: uint,
+        last-reward-block: uint,
+        accumulated-reward-per-share: uint
     }
 )
 
@@ -239,10 +268,37 @@
 )
 
 ;; Read-only functions
+
 (define-read-only (get-pool-details (pool-id uint))
     (match (map-get? pools { pool-id: pool-id })
         pool-info (ok pool-info)
         (err ERR-POOL-NOT-FOUND)
+    )
+)
+
+(define-read-only (get-twap-price (pool-id uint))
+    (match (map-get? pools { pool-id: pool-id })
+        pool-info 
+        (let (
+            (time-elapsed (- block-height (get price-timestamp pool-info)))
+        )
+        (asserts! (< time-elapsed ORACLE-VALIDITY-PERIOD) ERR-ORACLE-STALE)
+        (ok (get twap pool-info)))
+        (err ERR-POOL-NOT-FOUND)
+    )
+)
+
+(define-read-only (calculate-rewards (pool-id uint) (staker principal))
+    (match (map-get? liquidity-providers { pool-id: pool-id, provider: staker })
+        provider-info
+        (let (
+            (farm (unwrap! (map-get? yield-farms { pool-id: pool-id }) ERR-POOL-NOT-FOUND))
+            (blocks-elapsed (- block-height (get last-stake-block provider-info)))
+            (reward-rate (get reward-per-block farm))
+            (stake-amount (get staked-amount provider-info))
+        )
+        (ok (* (* blocks-elapsed reward-rate) (/ stake-amount (get total-staked farm)))))
+        (err ERR-NOT-AUTHORIZED)
     )
 )
 
