@@ -27,8 +27,12 @@
 (define-constant GOVERNANCE-TOKEN 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.governance-token)
 
 
-;; data vars
-;;
+;; Data variables
+(define-data-var next-pool-id uint u0)
+(define-data-var total-fees-collected uint u0)
+(define-data-var protocol-fee-rate uint u50) ;; 0.5% protocol fee
+(define-data-var emergency-shutdown boolean false)
+
 
 ;; Data maps for storing pool information
 (define-map pools 
