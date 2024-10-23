@@ -70,8 +70,37 @@
 ;; public functions
 ;;
 
-;; read only functions
-;;
+;; Read-only functions
+(define-read-only (get-pool-details (pool-id uint))
+    (match (map-get? pools { pool-id: pool-id })
+        pool-info (ok pool-info)
+        (err ERR-POOL-NOT-FOUND)
+    )
+)
+
+(define-read-only (get-provider-info (pool-id uint) (provider principal))
+    (match (map-get? liquidity-providers { pool-id: pool-id, provider: provider })
+        provider-info (ok provider-info)
+        (err ERR-NOT-AUTHORIZED)
+    )
+)
+
+(define-read-only (calculate-swap-output (pool-id uint) (input-amount uint) (is-x-to-y bool))
+    (match (map-get? pools { pool-id: pool-id })
+        pool-info 
+        (let (
+            (reserve-in (if is-x-to-y (get reserve-x pool-info) (get reserve-y pool-info)))
+            (reserve-out (if is-x-to-y (get reserve-y pool-info) (get reserve-x pool-info)))
+            (fee-adjustment (- FEE-DENOMINATOR (get fee-rate pool-info)))
+        )
+        (ok {
+            output: (/ (* input-amount (* reserve-out fee-adjustment)) 
+                      (+ (* reserve-in FEE-DENOMINATOR) (* input-amount fee-adjustment))),
+            fee: (/ (* input-amount (get fee-rate pool-info)) FEE-DENOMINATOR)
+        }))
+        (err ERR-POOL-NOT-FOUND)
+    )
+)
 
 ;; private functions
 ;;
