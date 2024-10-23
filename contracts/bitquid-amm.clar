@@ -186,6 +186,44 @@
     (ok (get output output)))
 )
 
+;; Governance functions
+
+(define-public (stake-governance (amount uint) (lock-blocks uint))
+    (let (
+        (current-stake (default-to { amount: u0, power: u0, lock-until: u0 } 
+            (map-get? governance-stakes { staker: tx-sender })))
+    )
+    
+    ;; Transfer governance tokens
+    (try! (contract-call? GOVERNANCE-TOKEN transfer amount tx-sender (as-contract tx-sender)))
+    
+    ;; Calculate voting power (more power for longer locks)
+    (let (
+        (power (* amount (+ u1 (/ lock-blocks u1000))))
+    )
+    
+    ;; Update stake
+    (map-set governance-stakes
+        { staker: tx-sender }
+        {
+            amount: (+ (get amount current-stake) amount),
+            power: (+ (get power current-stake) power),
+            lock-until: (+ block-height lock-blocks)
+        }
+    )
+    
+    (ok power)))
+)
+
+;; Emergency functions
+
+(define-public (toggle-emergency-shutdown)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (ok (var-set emergency-shutdown (not (var-get emergency-shutdown))))
+    )
+)
+
 ;; Read-only functions
 (define-read-only (get-pool-details (pool-id uint))
     (match (map-get? pools { pool-id: pool-id })
