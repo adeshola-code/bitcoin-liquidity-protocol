@@ -18,8 +18,14 @@
 ;; token definitions
 ;;
 
-;; constants
-;;
+;; Constants for protocol parameters
+(define-constant CONTRACT-OWNER tx-sender)
+(define-constant FEE-DENOMINATOR u10000)
+(define-constant INITIAL-LIQUIDITY-TOKENS u1000)
+(define-constant MAX-PRICE-IMPACT u200) ;; 2% max price impact
+(define-constant MIN-LIQUIDITY u1000000) ;; Minimum liquidity required
+(define-constant GOVERNANCE-TOKEN 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.governance-token)
+
 
 ;; data vars
 ;;
