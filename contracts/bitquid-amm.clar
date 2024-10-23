@@ -218,6 +218,22 @@
     )
 )
 
-;; private functions
-;;
+;; Internal functions
+
+(define-private (calculate-liquidity-shares (amount-x uint) (amount-y uint) (reserve-x uint) (reserve-y uint) (total-supply uint))
+    (if (is-eq total-supply u0)
+        INITIAL-LIQUIDITY-TOKENS
+        (min
+            (/ (* amount-x total-supply) reserve-x)
+            (/ (* amount-y total-supply) reserve-y)
+        )
+    )
+)
+
+(define-private (check-price-impact (amount uint) (reserve uint))
+    (let (
+        (impact (/ (* amount u10000) reserve))
+    )
+    (<= impact MAX-PRICE-IMPACT))
+)
 
